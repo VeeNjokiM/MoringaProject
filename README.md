@@ -19,3 +19,14 @@ The comprehensive README you generated using Prompt 1
 The step-by-step guide you created using Prompt 2
 The FAQ document you created using Prompt 3
 
+# Error and Debugging
+[notice] A new release of pip is available: 25.3 -> 26.0.1
+[notice] To update, run: C:\Users\HP\AppData\Local\Programs\Python\Python313-32\python.exe -m pip install --upgrade pip
+ERROR: No matching distribution found for MetaTrader5
+PS C:\Users\HP\PycharmProjects\PythonProject11>   
+
+1.Debugging the error uninstall the numpy and reinstall it again
+2.Change the Python Environment 
+
+# Run test
+python your_filename.py
