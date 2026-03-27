@@ -1,8 +1,393 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<module type="PYTHON_MODULE" version="4">
-  <component name="NewModuleRootManager">
-    <content url="file://$MODULE_DIR$" />
-    <orderEntry type="jdk" jdkName="Python 3.13" jdkType="Python SDK" />
-    <orderEntry type="sourceFolder" forTests="false" />
-  </component>
-</module>
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import time
+from datetime import datetime, date
+
+
+# ==============================
+# INITIALIZE MT5
+# ==============================
+if not mt5.initialize():
+    print("MT5 initialization failed")
+    mt5.shutdown()
+    quit()
+
+# ==============================
+# SETTINGS
+# ==============================
+SYMBOLS = ["BTCUSD","XAUUSD"]
+BASE_LOT = 0.01
+SCALP_LOT = 0.01
+SWING_LOT = 0.01
+
+CHECK_INTERVAL = 2
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 2.2
+ICC_LOOKBACK = 50
+ICC_MIN_IMPULSE_PIPS = 15
+ICC_CORRECTION_DEPTH = 0.382
+
+MAX_TRADES_PER_DAY = 5
+SCALP_CLOSE_PROFIT = 2
+SWING_CLOSE_PROFIT = 2
+
+MOMENTUM_BODY_RATIO = 0.55
+CANDLE_WAIT_SECONDS = 2
+DEBUG = True
+
+# ==============================
+# GLOBAL STATE
+# ==============================
+state = {}
+memory = {}
+
+for s in SYMBOLS:
+    state[s] = {
+        "icc_phase": "COMPLETE",
+        "impulse_high": 0,
+        "impulse_low": 0,
+        "is_impulse_bullish": False,
+        "trades_today": 0,
+        "mode": "SCALP"
+    }
+    memory[s] = {
+        "fvg": [],
+        "order_blocks": [],
+        "liquidity_zones": {"highs": [], "lows": []}
+    }
+
+last_day_checked = date.today()
+
+
+# ==============================
+# DEBUG LOG
+# ==============================
+def log(msg):
+    if DEBUG:
+        print("[DEBUG]", msg)
+
+
+# ==============================
+# DAILY RESET
+# ==============================
+def daily_reset():
+    global last_day_checked
+    today = date.today()
+    if today != last_day_checked:
+        last_day_checked = today
+        for s in SYMBOLS:
+            state[s]["trades_today"] = 0
+            state[s]["icc_phase"] = "COMPLETE"
+            state[s]["mode"] = "SCALP"
+        log("✅ NEW DAY RESET")
+
+
+# ==============================
+# ATR STOP LOSS
+# ==============================
+def get_atr(symbol):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, ATR_PERIOD + 5)
+    if rates is None:
+        return 0
+
+    df = pd.DataFrame(rates)
+    df["tr"] = np.maximum(df["high"] - df["low"],
+                          np.maximum(abs(df["high"] - df["close"].shift()),
+                                     abs(df["low"] - df["close"].shift())))
+    return df["tr"].rolling(ATR_PERIOD).mean().iloc[-1]
+
+
+# ==============================
+# MODE SWITCH LOGIC (SCALP VS SWING)
+# ==============================
+def detect_trade_mode(symbol):
+    atr = get_atr(symbol)
+
+    if atr < 0.25:
+        state[symbol]["mode"] = "SCALP"
+    else:
+        state[symbol]["mode"] = "SWING"
+
+
+# ==============================
+# FVG DETECTION
+# ==============================
+def detect_fvg(symbol):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 120)
+    if rates is None:
+        return
+
+    df = pd.DataFrame(rates)
+    fvg_list = []
+
+    for i in range(2, len(df)):
+        if df["low"].iloc[i] > df["high"].iloc[i - 2]:
+            fvg_list.append(("BULL", df["high"].iloc[i - 2], df["low"].iloc[i]))
+        if df["high"].iloc[i] < df["low"].iloc[i - 2]:
+            fvg_list.append(("BEAR", df["low"].iloc[i - 2], df["high"].iloc[i]))
+
+    memory[symbol]["fvg"] = fvg_list[-10:]
+
+
+# ==============================
+# ORDER BLOCK DETECTION
+# ==============================
+def detect_order_blocks(symbol):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 120)
+    if rates is None:
+        return
+
+    df = pd.DataFrame(rates)
+    ob_list = []
+
+    for i in range(1, len(df)):
+        if df["close"].iloc[i] > df["open"].iloc[i] and df["close"].iloc[i - 1] < df["open"].iloc[i - 1]:
+            ob_list.append(("BULL", df["low"].iloc[i - 1], df["high"].iloc[i - 1]))
+
+        if df["close"].iloc[i] < df["open"].iloc[i] and df["close"].iloc[i - 1] > df["open"].iloc[i - 1]:
+            ob_list.append(("BEAR", df["high"].iloc[i - 1], df["low"].iloc[i - 1]))
+
+    memory[symbol]["order_blocks"] = ob_list[-10:]
+
+
+# ==============================
+# LIQUIDITY DETECTION
+# ==============================
+def detect_liquidity(symbol):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 200)
+    if rates is None:
+        return
+
+    df = pd.DataFrame(rates)
+    memory[symbol]["liquidity_zones"]["highs"] = df["high"].rolling(20).max().dropna().tolist()[-10:]
+    memory[symbol]["liquidity_zones"]["lows"] = df["low"].rolling(20).min().dropna().tolist()[-10:]
+
+
+# ==============================
+# ICC ENGINE
+# ==============================
+def detect_icc_phase(symbol):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, ICC_LOOKBACK * 2)
+    if rates is None:
+        return
+
+    df = pd.DataFrame(rates)
+    recent = df.iloc[-30:]
+
+    recent_high = recent["high"].max()
+    recent_low = recent["low"].min()
+
+    impulse_size = (recent_high - recent_low) / 0.1
+
+    if impulse_size >= ICC_MIN_IMPULSE_PIPS * 10 and state[symbol]["icc_phase"] == "COMPLETE":
+        high_index = recent["high"].idxmax()
+        low_index = recent["low"].idxmin()
+
+        state[symbol]["is_impulse_bullish"] = low_index < high_index
+        state[symbol]["impulse_high"] = recent_high
+        state[symbol]["impulse_low"] = recent_low
+        state[symbol]["icc_phase"] = "INDICATION"
+
+        log(f"[{symbol}] ICC IMPULSE")
+
+    price = df["close"].iloc[-1]
+
+    if state[symbol]["icc_phase"] == "INDICATION":
+        correction_level = state[symbol]["impulse_high"] - (
+                (state[symbol]["impulse_high"] - state[symbol]["impulse_low"]) * ICC_CORRECTION_DEPTH
+        )
+
+        if (state[symbol]["is_impulse_bullish"] and price <= correction_level) or \
+                (not state[symbol]["is_impulse_bullish"] and price >= correction_level):
+            state[symbol]["icc_phase"] = "CORRECTION"
+
+    if state[symbol]["icc_phase"] == "CORRECTION":
+        if state[symbol]["is_impulse_bullish"] and price > state[symbol]["impulse_low"]:
+            state[symbol]["icc_phase"] = "CONTINUATION"
+        if not state[symbol]["is_impulse_bullish"] and price < state[symbol]["impulse_high"]:
+            state[symbol]["icc_phase"] = "CONTINUATION"
+
+
+# ==============================
+# MOMENTUM & CANDLE DIRECTION FILTER
+# ==============================
+def candle_momentum_ok(symbol):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 2)
+    if rates is None:
+        return False, None
+
+    df = pd.DataFrame(rates)
+    candle = df.iloc[-1]
+
+    body = abs(candle["close"] - candle["open"])
+    wick = (candle["high"] - candle["low"]) - body
+
+    if body == 0:
+        return False, None
+
+    ratio = body / (wick + 1e-6)
+
+    direction = "BUY" if candle["close"] > candle["open"] else "SELL"
+
+    return ratio >= MOMENTUM_BODY_RATIO, direction
+
+
+# ==============================
+# TECH TREND FILTER
+# ==============================
+def get_trend(symbol):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 40)
+    if rates is None:
+        return 0
+
+    df = pd.DataFrame(rates)
+    df["MA10"] = df["close"].rolling(10).mean()
+    df["MA20"] = df["close"].rolling(20).mean()
+
+    return 1 if df["MA10"].iloc[-1] > df["MA20"].iloc[-1] else -1
+
+
+# ==============================
+# EXECUTE TRADE
+# ==============================
+def execute_trade(symbol, direction):
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return
+
+    mode = state[symbol]["mode"]
+    atr = get_atr(symbol)
+
+    lot = SCALP_LOT if mode == "SCALP" else SWING_LOT
+    rr = 1.5 if mode == "SCALP" else 3.5
+
+    price = tick.ask if direction == "BUY" else tick.bid
+    sl = price - atr * 2 if direction == "BUY" else price + atr * 2
+    tp = price + atr * rr if direction == "BUY" else price - atr * rr
+
+    order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot,
+        "type": order_type,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "deviation": 10,
+        "magic": 999111,
+        "comment": f"ICC_{mode}",
+        "type_filling": mt5.ORDER_FILLING_FOK,
+    }
+
+    result = mt5.order_send(request)
+
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        state[symbol]["trades_today"] += 1
+        state[symbol]["icc_phase"] = "COMPLETE"
+        log(f"✅ {symbol} {mode} TRADE OPENED: {direction}")
+
+
+# ==============================
+# CLOSE POSITION
+# ==============================
+def close_position(pos, price):
+    close_type = mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": pos.symbol,
+        "volume": pos.volume,
+        "type": close_type,
+        "position": pos.ticket,
+        "price": price,
+        "deviation": 10,
+        "magic": pos.magic,
+        "comment": "AUTO CLOSE",
+        "type_filling": mt5.ORDER_FILLING_FOK
+    }
+
+    mt5.order_send(request)
+
+
+# ==============================
+# TRADE MONITOR
+# ==============================
+def monitor_trades(symbol):
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        return
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return
+
+    for pos in positions:
+        price = tick.bid if pos.type == 0 else tick.ask
+        mode = "SCALP" if pos.comment.find("SCALP") != -1 else "SWING"
+
+        # SCALP FAST EXIT
+        if mode == "SCALP" and pos.profit >= SCALP_CLOSE_PROFIT:
+            close_position(pos, price)
+
+        # SWING TARGET EXIT
+        if mode == "SWING" and pos.profit >= SWING_CLOSE_PROFIT:
+            close_position(pos, price)
+
+        # SL OR TP
+        if (pos.type == 0 and price <= pos.sl) or (pos.type == 1 and price >= pos.sl):
+            close_position(pos, price)
+
+        if (pos.type == 0 and price >= pos.tp) or (pos.type == 1 and price <= pos.tp):
+            close_position(pos, price)
+
+
+# ==============================
+# MAIN LOOP
+# ==============================
+def main():
+    print("\n=== HYBRID AI SCALP + SWING BOT RUNNING ===\n")
+
+    while True:
+        daily_reset()
+
+        for s in SYMBOLS:
+            detect_trade_mode(s)
+            detect_icc_phase(s)
+            detect_fvg(s)
+            detect_order_blocks(s)
+            detect_liquidity(s)
+
+            trend = get_trend(s)
+            momentum_ok, candle_dir = candle_momentum_ok(s)
+
+            # WAIT FOR MOMENTUM CONFIRMATION
+            time.sleep(CANDLE_WAIT_SECONDS)
+
+            if state[s]["icc_phase"] == "CONTINUATION" and momentum_ok and state[s][
+                "trades_today"] < MAX_TRADES_PER_DAY:
+
+                if candle_dir == "BUY" and trend > 0 and len(memory[s]["fvg"]) > 0:
+                    log(f"[{s}] BUY CONFIRMED | Mode: {state[s]['mode']}")
+                    execute_trade(s, "BUY")
+
+                elif candle_dir == "SELL" and trend < 0 and len(memory[s]["order_blocks"]) > 0:
+                    log(f"[{s}] SELL CONFIRMED | Mode: {state[s]['mode']}")
+                    execute_trade(s, "SELL")
+
+            monitor_trades(s)
+
+        time.sleep(CHECK_INTERVAL)
+
+
+# ==============================
+# RUN BOT
+# ==============================
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nBOT STOPPED")   
+        mt5.shutdown()
